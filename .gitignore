@@ -1,0 +1,6 @@
+# Output
+*.so
+
+# VIM
+.sw?
+.*.sw?
