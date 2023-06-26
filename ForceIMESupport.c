@@ -170,7 +170,8 @@ XIM XOpenIM(Display *display, XrmDatabase db, char *res_name, char *res_class) {
 //
 // XNInputStyle:
 // Using XIMPreeditNothing | XIMStatusNothing.
-// Not to be confused with XIMPreeditNone | XIMStatusNone, which prevents the IME from working, and is explicitly requested by Unity 2019.
+// Not to be confused with XIMPreeditNone | XIMStatusNone, which prevents the IME from working.
+// UPDATE: I accidentally said that Unity 2019 uses None. It uses Nothing instead, which is what we currently want.
 //
 // XNClientWindow:
 // A compulsory argument. We need to grab this from the program.
