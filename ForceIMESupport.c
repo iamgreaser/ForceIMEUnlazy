@@ -1,6 +1,6 @@
 // vim: set sts=2 sw=2 et :
 //
-// ForceIMESupport v001+dev
+// ForceIMESupport v002
 // Written by GreaseMonkey, 2022-2023. I release this software into the public domain.
 //
 // This is an LD_PRELOAD injection library which forces poorly-written software to accept input from an IME
