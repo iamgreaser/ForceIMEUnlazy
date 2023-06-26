@@ -1,7 +1,7 @@
 // vim: set sts=2 sw=2 et :
 //
-// ForceIMESupport v001
-// Written by GreaseMonkey, 2022. I release this software into the public domain.
+// ForceIMESupport v001+dev
+// Written by GreaseMonkey, 2022-2023. I release this software into the public domain.
 //
 // This is an LD_PRELOAD injection library which forces poorly-written software to accept input from an IME
 // In this case, said poorly-written software is Unity 2019.
@@ -9,22 +9,21 @@
 //  ...oh whoops, it scrolled up instead.)
 // More specifically, this is designed to force IME support into NeosVR.
 //
+// UPDATED KNOWLEDGE: Unity 2019 uses some version of SDL for its input on Linux.
+//
 // Here's what this does:
 //
 // - Prior to calling XOpenIM(), we set the locale up so that your IME knows it can be used.
 //
 // - We intercept XCreateIC() to ensure that it gives a "preedit nothing" context, which means that the IME can actually be used. (If you asked for PreeditNone, you probably can't handle preedit information.)
 //
-// - We assume that XFilterEvent() is either not called, or called in such a way that the IME won't work.
-//   - Any calls to XFilterEvent() from the program are ignored and return False.
-//
 // - Some poorly-written software (e.g. Unity) calls Xutf8LookupString(), expecting it to return only one character, and then it proceeds to ignore the rest.
 //   - We have a buffer for this which acts somewhat like a back-to-back pair of FIFO queue.
-//
-// - XNextEvent() does 2 things:
-//   - If we have any characters in our buffer, we synthesise and return a dummy KeyPress event with a keycode of None. By some miracle, Unity actually accepts this.
-//     - This factors in how many characters are actually in the buffer.
-//   - Calls the real XNextEvent() followed by an XFilterEvent() in a loop until it returns False.
+//   - We return 1 character, and then while this buffer still has stuff, we mess with other calls:
+//     - XPending() returns True.
+//     - XEventsQueued() returns 1 more than what's actually there.
+//     - XFilterEvent() returns False if it's a KeyPress event with a keycode of None.
+//     - XNextEvent() returns a dummy KeyPress with a keycode of None.
 //
 // I wouldn't call this particularly well-written at this point. But at least it does a better job of input than Unity does.
 //
@@ -58,7 +57,11 @@
 #define MAX_BYTES_IN 4096
 unsigned char text_string_buffer[MAX_BYTES_IN];
 int text_string_used = 0;
-int text_string_reported = 0;
+
+//
+// This is used as a dummy event to return from XNextEvent() when we need to pass more characters to Unity.
+//
+XEvent last_key_event;
 
 //
 // This is a helper function for dealing with UTF-8 data.
@@ -99,7 +102,10 @@ int Xutf8LookupString(XIC ic, XKeyPressedEvent *event, char *buffer_return, int 
   if (real == NULL) { real = dlsym(RTLD_NEXT, "Xutf8LookupString"); }
   if (real == NULL) { abort(); };
 
-  int added = real(ic, event, (char *)&text_string_buffer[text_string_used], MAX_BYTES_IN - text_string_used, keysym_return, status_return);
+  int added = 0;
+  if (text_string_used == 0) {
+    added = real(ic, event, (char *)&text_string_buffer[text_string_used], MAX_BYTES_IN - text_string_used, keysym_return, status_return);
+  }
   //fprintf(stderr, "shimmed Xutf8LookupString! %d bytes, got %d\n", text_string_used, added); fflush(stderr);
 
   int new_used = text_string_used + added;
@@ -128,7 +134,6 @@ int Xutf8LookupString(XIC ic, XKeyPressedEvent *event, char *buffer_return, int 
 
     // Remove from the original buffer
     text_string_used -= bytes_to_grab;
-    text_string_reported -= bytes_to_grab;
     if (text_string_used >= 0) {
       memmove(&text_string_buffer[0], &text_string_buffer[bytes_to_grab], text_string_used);
     }
@@ -226,26 +231,45 @@ XIC XCreateIC(XIM im, ...) {
 }
 
 //
-// We handle XFilterEvent(), and nobody else gets to.
-// This function is internal to this library.
+// We may need to force our fake events through the system.
 //
-static Bool real_XFilterEvent(XEvent *event, Window w) {
+Bool XFilterEvent(XEvent *event, Window w) {
   int (*real)(XEvent *event, Window w) = NULL;
   if (real == NULL) { real = dlsym(RTLD_NEXT, "XFilterEvent"); }
   if (real == NULL) { abort(); };
+
+  // Do not filter the fake events.
+  if (text_string_used > 0 && event->type == KeyPress && event->xkey.keycode == None) {
+    return False;
+  }
+
   return real(event, w);
 }
 
-//
-// If the program tries to call XFilterEvent(), tough.
-// We've already filtered any relevant events here.
-//
-Bool XFilterEvent(XEvent *event, Window w) {
-  // We do the filtering on XNextEvent.
-  // Any application-specific filtering is to be ignored.
-  (void)event;
-  (void)w;
-  return False;
+int XPending(Display *display) {
+  int (*real)(Display *display) = NULL;
+  if (real == NULL) { real = dlsym(RTLD_NEXT, "XPending"); }
+  if (real == NULL) { abort(); };
+
+  // Announce our fake events.
+  if (text_string_used > 0) {
+    return True;
+  }
+
+  return real(display);
+}
+
+int XEventsQueued(Display *display, int mode) {
+  int (*real)(Display *display, int mode) = NULL;
+  if (real == NULL) { real = dlsym(RTLD_NEXT, "XEventsQueued"); }
+  if (real == NULL) { abort(); };
+
+  // Announce our fake events.
+  int result = real(display, mode);
+  if (text_string_used > 0) {
+    return result + 1;
+  }
+  return result;
 }
 
 //
@@ -254,7 +278,6 @@ Bool XFilterEvent(XEvent *event, Window w) {
 // ... unless we need to tell the program that there's still more text to accept.
 //
 int XNextEvent(Display *display, XEvent *event_return) {
-  static XEvent last_key_event;
   static int last_result = 0; // FIXME: The return value of this doesn't seem to be defined...? Grab it from a valid call to XNextEvent anyway. --GM
 
   static int (*real)(Display *display, XEvent *event_return) = NULL;
@@ -263,45 +286,17 @@ int XNextEvent(Display *display, XEvent *event_return) {
 
   // If we have more characters to pass through,
   // synthesise some KeyPress events in order to pass them through.
-  if (text_string_reported < text_string_used) {
+  if (text_string_used > 0) {
     *event_return = last_key_event;
     event_return->xkey.type = KeyPress;
     event_return->xkey.keycode = None;
-    text_string_reported += _buf_char_len(text_string_reported);
     return last_result;
   }
 
-  //fprintf(stderr, "shimming XNextEvent\n"); fflush(stderr);
-  int result;
-  for (;;) {
-    XEvent evtemp = {};
-    evtemp.type = -1;
-    result = real(display, &evtemp);
-
-    // FIXME: check other windows --GM
-    Bool filter_me = real_XFilterEvent(&evtemp, None);
-    if (filter_me) {
-      static int filtcount = 0;
-      filtcount += 1;
-      //fprintf(stderr, "filtered %d %d\n", filtcount, evtemp.type);
-      continue;
-    } else {
-      //fprintf(stderr, "unfiltered\n");
-    }
-
-    if (evtemp.type == KeyPress) {
-      last_result = result;
-      last_key_event = evtemp;
-    }
-
-    // NOTE: Unity does not use traditional X11 for its mouse events.
-    // It probably uses XInput2.
-
-    memcpy(event_return, &evtemp, sizeof(evtemp));
-    break;
+  int result = real(display, event_return);
+  if (event_return->type == KeyPress) {
+    last_key_event = *event_return;
   }
-
-  //fprintf(stderr, "shimmed XNextEvent!\n"); fflush(stderr);
 
   return result;
 }
@@ -317,10 +312,12 @@ void *Dlsym(void *restrict handle, const char *restrict symbol)
 {
   //fprintf(stderr, "Dlsym -> dlsym shim: %p \"%s\"\n", handle, symbol); fflush(stderr);
 
-  if (!strcmp(symbol, "XOpenIM")) { return XOpenIM; }
   if (!strcmp(symbol, "XCreateIC")) { return XCreateIC; }
-  if (!strcmp(symbol, "XNextEvent")) { return XNextEvent; }
+  if (!strcmp(symbol, "XEventsQueued")) { return XEventsQueued; }
   if (!strcmp(symbol, "XFilterEvent")) { return XFilterEvent; }
+  if (!strcmp(symbol, "XNextEvent")) { return XNextEvent; }
+  if (!strcmp(symbol, "XOpenIM")) { return XOpenIM; }
+  if (!strcmp(symbol, "XPending")) { return XPending; }
   if (!strcmp(symbol, "Xutf8LookupString")) { return Xutf8LookupString; }
 
   return dlsym(handle, symbol);
